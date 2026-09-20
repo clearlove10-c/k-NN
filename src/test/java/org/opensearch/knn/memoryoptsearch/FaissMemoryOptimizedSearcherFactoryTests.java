@@ -7,17 +7,27 @@ package org.opensearch.knn.memoryoptsearch;
 
 import java.nio.charset.StandardCharsets;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import lombok.SneakyThrows;
 import org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil;
 import org.apache.lucene.codecs.hnsw.FlatVectorsReader;
 import org.apache.lucene.codecs.hnsw.FlatVectorsScorer;
 import org.apache.lucene.codecs.lucene104.Lucene104ScalarQuantizedVectorScorer;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.VectorEncoding;
+import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.KNNConstants;
 import org.opensearch.knn.index.SpaceType;
@@ -218,7 +228,82 @@ public class FaissMemoryOptimizedSearcherFactoryTests extends KNNTestCase {
     }
 
     @SneakyThrows
+    public void testCreateVectorSearcher_whenWarmUpIoContextProvided_thenWarmUpOpensDedicatedSequentialStream() {
+        final FaissMemoryOptimizedSearcherFactory factory = new FaissMemoryOptimizedSearcherFactory();
+        final Path tempDir = createTempDir(UUID.randomUUID().toString());
+        final String fileName = "test_warmup.faiss";
+
+        // Build a mock FaissIdMapIndex that FaissIndex.load returns.
+        final FaissHNSW faissHNSW = mock(FaissHNSW.class);
+        final FaissIdMapIndex idMapIndex = mock(FaissIdMapIndex.class);
+        Mockito.when(idMapIndex.getFaissHnsw()).thenReturn(faissHNSW);
+        Mockito.when(idMapIndex.getVectorSimilarityFunction()).thenReturn(SpaceType.L2.getKnnVectorSimilarityFunction());
+        Mockito.when(idMapIndex.getVectorEncoding()).thenReturn(VectorEncoding.FLOAT32);
+        Mockito.when(idMapIndex.getFloatValues(any())).thenReturn(mock(FloatVectorValues.class));
+
+        final FieldInfo fieldInfo = mock(FieldInfo.class);
+        Mockito.when(fieldInfo.getAttribute(KNNConstants.SPACE_TYPE)).thenReturn(SpaceType.L2.getValue());
+
+        final FlatVectorsReader flatVectorsReader = mock(FlatVectorsReader.class);
+        Mockito.when(flatVectorsReader.getFlatVectorScorer(any())).thenReturn(SCORER);
+
+        // Warmup context mirroring AbstractNativeEnginesKnnVectorsReader's derivation.
+        final IOContext warmUpIoContext = IOContext.DEFAULT.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.SEQUENTIAL);
+
+        try (RecordingDirectory directory = new RecordingDirectory(newFSDirectory(tempDir))) {
+            try (IndexOutput output = directory.createOutput(fileName, IOContext.DEFAULT)) {
+                output.writeBytes(new byte[16], 16); // placeholder bytes, load is mocked
+            }
+
+            try (MockedStatic<FaissIndex> mockStaticFaissIndex = mockStatic(FaissIndex.class)) {
+                mockStaticFaissIndex.when(() -> FaissIndex.load(any(IndexInput.class))).thenReturn(idMapIndex);
+
+                final VectorSearcher searcher = factory.createVectorSearcher(
+                    directory,
+                    fileName,
+                    fieldInfo,
+                    IOContext.DEFAULT,
+                    warmUpIoContext,
+                    flatVectorsReader
+                );
+                assertNotNull(searcher);
+                try {
+                    searcher.warmUp();
+                } finally {
+                    searcher.close();
+                }
+            }
+
+            // First openInput: search input (with the caller-provided ioContext).
+            // Second openInput: dedicated warmup stream (with the SEQUENTIAL-advised context).
+            assertEquals(2, directory.openedContexts.size());
+            assertSame(IOContext.DEFAULT, directory.openedContexts.get(0));
+            assertSame(warmUpIoContext, directory.openedContexts.get(1));
+            assertTrue(directory.openedContexts.get(1).hints().contains(DataAccessHint.SEQUENTIAL));
+            assertFalse(directory.openedContexts.get(1).hints().contains(DataAccessHint.RANDOM));
+        }
+    }
+
+    @SneakyThrows
     private byte[] loadResourceBytes(String resourcePath) {
         return FaissHNSWTests.class.getClassLoader().getResourceAsStream(resourcePath).readAllBytes();
+    }
+
+    /**
+     * A Directory wrapper that records the {@link IOContext} of every {@code openInput} call,
+     * so tests can assert which context each code path used.
+     */
+    static class RecordingDirectory extends FilterDirectory {
+        final List<IOContext> openedContexts = new ArrayList<>();
+
+        RecordingDirectory(Directory in) {
+            super(in);
+        }
+
+        @Override
+        public IndexInput openInput(String name, IOContext context) throws IOException {
+            openedContexts.add(context);
+            return in.openInput(name, context);
+        }
     }
 }

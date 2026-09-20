@@ -40,4 +40,38 @@ public interface VectorSearcherFactory {
         IOContext ioContext,
         FlatVectorsReader flatVectorsReader
     ) throws IOException;
+
+    /**
+     * Create a non-null {@link VectorSearcher} with given Lucene's {@link Directory}, additionally
+     * providing an {@link IOContext} dedicated to warmup.
+     * <p>
+     * The {@code warmUpIoContext} is expected to carry a {@link org.apache.lucene.store.DataAccessHint#SEQUENTIAL}
+     * data-access hint so that implementations can open a separate readahead-friendly stream over the same
+     * file for warmup, instead of reusing the {@code ioContext} mapping (which is typically
+     * {@link org.apache.lucene.store.DataAccessHint#RANDOM}-advised and disables kernel readahead).
+     * <p>
+     * The default implementation ignores the warmup context and falls back to the legacy signature,
+     * preserving behavior for factories that do not support a dedicated warmup stream.
+     *
+     * @param directory Lucene's Directory.
+     * @param fileName Logical file name to load.
+     * @param fieldInfo Field info containing metadata for ADC extraction
+     * @param ioContext IOContext to use when opening the file for search
+     * @param warmUpIoContext IOContext carrying the SEQUENTIAL data-access hint to use when the
+     *                        searcher opens a dedicated warmup stream; may be ignored by the
+     *                        implementation
+     * @param flatVectorsReader Reader providing flat vector scoring and storage
+     * @return Null instance if it is not supported, otherwise return {@link VectorSearcher}
+     * @throws IOException if an I/O error occurs
+     */
+    default VectorSearcher createVectorSearcher(
+        Directory directory,
+        String fileName,
+        FieldInfo fieldInfo,
+        IOContext ioContext,
+        IOContext warmUpIoContext,
+        FlatVectorsReader flatVectorsReader
+    ) throws IOException {
+        return createVectorSearcher(directory, fileName, fieldInfo, ioContext, flatVectorsReader);
+    }
 }

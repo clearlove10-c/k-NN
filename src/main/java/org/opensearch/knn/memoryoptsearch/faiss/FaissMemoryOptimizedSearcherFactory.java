@@ -33,6 +33,7 @@ public class FaissMemoryOptimizedSearcherFactory implements VectorSearcherFactor
         final String fileName,
         final FieldInfo fieldInfo,
         final IOContext ioContext,
+        final IOContext warmUpIoContext,
         final FlatVectorsReader flatVectorsReader
     ) throws IOException {
         final IndexInput indexInput = directory.openInput(fileName, ioContext);
@@ -45,7 +46,7 @@ public class FaissMemoryOptimizedSearcherFactory implements VectorSearcherFactor
                 faissIndex.getVectorSimilarityFunction(),
                 flatVectorsReader.getFlatVectorScorer(fieldInfo.name)
             );
-            return new FaissMemoryOptimizedSearcher(indexInput, faissIndex, fieldInfo, vectorScorer);
+            return new FaissMemoryOptimizedSearcher(indexInput, faissIndex, fieldInfo, vectorScorer, directory, fileName, warmUpIoContext);
         } catch (UnsupportedFaissIndexException e) {
             // Clean up input stream.
             try {
@@ -54,6 +55,19 @@ public class FaissMemoryOptimizedSearcherFactory implements VectorSearcherFactor
 
             throw e;
         }
+    }
+
+    @Override
+    public VectorSearcher createVectorSearcher(
+        final Directory directory,
+        final String fileName,
+        final FieldInfo fieldInfo,
+        final IOContext ioContext,
+        final FlatVectorsReader flatVectorsReader
+    ) throws IOException {
+        // Legacy path without a dedicated warmup IO context: the searcher falls back to warming
+        // up through the RANDOM-advised search input.
+        return createVectorSearcher(directory, fileName, fieldInfo, ioContext, null, flatVectorsReader);
     }
 
 }

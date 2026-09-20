@@ -23,6 +23,7 @@ import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.SegmentInfo;
@@ -37,6 +38,7 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopKnnCollector;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
+import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
@@ -90,6 +92,7 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -102,9 +105,14 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
+import org.mockito.ArgumentCaptor;
+
 import static java.util.stream.Collectors.toMap;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.opensearch.knn.common.KNNConstants.ADC_ENABLED_FAISS_INDEX_INTERNAL_PARAMETER;
@@ -456,6 +464,106 @@ public class FaissMemoryOptimizedSearcherTests extends KNNTestCase {
         for (int i = 0; i < 3; i++) {
             Mockito.verify(mockByteValues).vectorValue(i);
         }
+    }
+
+    /**
+     * When the searcher is constructed with a dedicated warmup stream configuration, warmUp()
+     * must open the graph file through {@code directory.openInput(fileName, warmUpIoContext)}
+     * and fully read it there, instead of reading through the RANDOM-advised search input
+     * (whose mapping disables kernel readahead). The flat-vector pass keeps using the cloned
+     * search input.
+     */
+    @SneakyThrows
+    public void testWarmUp_whenDedicatedWarmupStreamConfigured_readsGraphViaSequentialStream() {
+        final FieldInfo fieldInfo = mock(FieldInfo.class);
+        Mockito.when(fieldInfo.getAttribute(KNNConstants.SPACE_TYPE)).thenReturn(SpaceType.L2.getValue());
+
+        final FaissIdMapIndex faissIndex = mock(FaissIdMapIndex.class);
+        Mockito.when(faissIndex.getVectorSimilarityFunction()).thenReturn(SpaceType.L2.getKnnVectorSimilarityFunction());
+        Mockito.when(faissIndex.getFaissHnsw()).thenReturn(mock(FaissHNSW.class));
+        Mockito.when(faissIndex.getVectorEncoding()).thenReturn(VectorEncoding.FLOAT32);
+
+        final FloatVectorValues mockFloatValues = mock(FloatVectorValues.class);
+        when(mockFloatValues.size()).thenReturn(0);
+        Mockito.when(faissIndex.getFloatValues(any())).thenReturn(mockFloatValues);
+
+        final IndexInput searchInput = mock(IndexInput.class);
+        when(searchInput.clone()).thenReturn(searchInput);
+        when(searchInput.length()).thenReturn(0L);
+
+        final IndexInput warmupInput = mock(IndexInput.class);
+        when(warmupInput.length()).thenReturn(8L);
+
+        final Directory mockDirectory = mock(Directory.class);
+        when(mockDirectory.openInput(eq("test_index.faiss"), any(IOContext.class))).thenReturn(warmupInput);
+
+        final IOContext warmUpIoContext = IOContext.DEFAULT.withHints(DataAccessHint.SEQUENTIAL);
+        final FaissMemoryOptimizedSearcher searcher = new FaissMemoryOptimizedSearcher(
+            searchInput,
+            faissIndex,
+            fieldInfo,
+            FlatVectorsScorerProvider.getFlatVectorsScorer(fieldInfo, KNNVectorSimilarityFunction.EUCLIDEAN, SCORER),
+            mockDirectory,
+            "test_index.faiss",
+            warmUpIoContext
+        );
+
+        searcher.warmUp();
+
+        // Graph must be read through the dedicated warmup stream...
+        final ArgumentCaptor<IOContext> ctxCaptor = ArgumentCaptor.forClass(IOContext.class);
+        verify(mockDirectory).openInput(eq("test_index.faiss"), ctxCaptor.capture());
+        assertSame(warmUpIoContext, ctxCaptor.getValue());
+        verify(warmupInput).seek(0);
+        verify(warmupInput).readBytes(any(byte[].class), eq(0), eq(8));
+        // ... and the warmup stream must be closed after use.
+        verify(warmupInput).close();
+        // The search input's graph bytes must NOT be re-read (flat-vector pass may still clone).
+        verify(searchInput, never()).readBytes(any(), anyInt(), anyInt());
+        verify(searchInput, never()).readByte();
+    }
+
+    /**
+     * If the warmup stream's file vanished (e.g. the segment was just merged away), warmUp()
+     * must fall back to the legacy path of reading the graph through the cloned search input,
+     * which still holds a valid file descriptor.
+     */
+    @SneakyThrows
+    public void testWarmUp_whenWarmupStreamFileVanished_fallsBackToSearchInput() {
+        final FieldInfo fieldInfo = mock(FieldInfo.class);
+        Mockito.when(fieldInfo.getAttribute(KNNConstants.SPACE_TYPE)).thenReturn(SpaceType.L2.getValue());
+
+        final FaissIdMapIndex faissIndex = mock(FaissIdMapIndex.class);
+        Mockito.when(faissIndex.getVectorSimilarityFunction()).thenReturn(SpaceType.L2.getKnnVectorSimilarityFunction());
+        Mockito.when(faissIndex.getFaissHnsw()).thenReturn(mock(FaissHNSW.class));
+        Mockito.when(faissIndex.getVectorEncoding()).thenReturn(VectorEncoding.FLOAT32);
+
+        final FloatVectorValues mockFloatValues = mock(FloatVectorValues.class);
+        when(mockFloatValues.size()).thenReturn(0);
+        Mockito.when(faissIndex.getFloatValues(any())).thenReturn(mockFloatValues);
+
+        final IndexInput searchInput = mock(IndexInput.class);
+        when(searchInput.clone()).thenReturn(searchInput);
+        when(searchInput.length()).thenReturn(8L);
+
+        final Directory mockDirectory = mock(Directory.class);
+        when(mockDirectory.openInput(eq("test_index.faiss"), any(IOContext.class))).thenThrow(new NoSuchFileException("test_index.faiss"));
+
+        final FaissMemoryOptimizedSearcher searcher = new FaissMemoryOptimizedSearcher(
+            searchInput,
+            faissIndex,
+            fieldInfo,
+            FlatVectorsScorerProvider.getFlatVectorsScorer(fieldInfo, KNNVectorSimilarityFunction.EUCLIDEAN, SCORER),
+            mockDirectory,
+            "test_index.faiss",
+            IOContext.DEFAULT.withHints(DataAccessHint.SEQUENTIAL)
+        );
+
+        searcher.warmUp();
+
+        // Fallback: the graph is fully read through the cloned search input.
+        verify(searchInput).seek(0);
+        verify(searchInput).readBytes(any(byte[].class), eq(0), eq(8));
     }
 
     @SneakyThrows

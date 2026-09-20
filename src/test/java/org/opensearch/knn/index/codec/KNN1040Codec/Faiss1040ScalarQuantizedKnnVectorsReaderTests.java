@@ -87,6 +87,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsReaderTests extends KNNTestCase {
                 anyString(),
                 any(FieldInfo.class),
                 any(IOContext.class),
+                any(IOContext.class),
                 any(FlatVectorsReader.class)
             )
         ).thenReturn(mockSearcher);
@@ -147,6 +148,7 @@ public class Faiss1040ScalarQuantizedKnnVectorsReaderTests extends KNNTestCase {
                 any(Directory.class),
                 anyString(),
                 any(FieldInfo.class),
+                any(IOContext.class),
                 any(IOContext.class),
                 any(FlatVectorsReader.class)
             )

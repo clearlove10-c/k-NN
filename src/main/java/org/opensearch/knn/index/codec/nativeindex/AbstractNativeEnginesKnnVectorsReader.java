@@ -46,6 +46,7 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
     protected final FlatVectorsReader flatVectorsReader;
     protected final SegmentReadState segmentReadState;
     protected final IOContext ioContext;
+    protected final IOContext warmUpIoContext;
     protected volatile VectorSearcherHolder vectorSearcherHolder;
     // This lock object ensure that only one thread can initialize vectorSearcherHolder object.
     // This is needed since we are mappings graphs to memory for memory optimized search lazily. But once we make it eager
@@ -57,6 +58,7 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
         this.flatVectorsReader = flatVectorsReader;
         this.segmentReadState = state;
         this.ioContext = state.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM);
+        this.warmUpIoContext = state.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.SEQUENTIAL);
         this.vectorSearcherHolder = new VectorSearcherHolder();
         this.vectorSearcherHolderLockObject = new Object();
         this.fieldInfos = state.fieldInfos;
@@ -167,6 +169,7 @@ public abstract class AbstractNativeEnginesKnnVectorsReader extends KnnVectorsRe
                 fileName,
                 fieldInfo,
                 ioContext,
+                warmUpIoContext,
                 flatVectorsReader
             );
         }

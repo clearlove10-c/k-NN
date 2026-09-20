@@ -71,15 +71,28 @@ public class WarmupUtil {
     }
 
     /**
+     * Size of the buffer used to bulk-read the index input during warmup.
+     */
+    private static final int READ_ALL_BUFFER_SIZE = 64 * 1024;
+
+    /**
      * Warms up an {@link IndexInput} by sequentially reading every byte from the beginning.
+     * <p>
+     * The read is performed in bulk chunks via {@link IndexInput#readBytes(byte[], int, int)}.
+     * A bulk copy cannot be eliminated by the JIT as dead code (unlike a {@code readByte()}
+     * loop that discards the returned value), and it touches the same pages, so the page-cache
+     * warming effect is identical while being friendlier to the CPU.
      *
      * @param indexInput the index input to warm up
      * @throws IOException if an I/O error occurs during reading
      */
     public static void readAll(@NonNull final IndexInput indexInput) throws IOException {
         indexInput.seek(0);
-        for (long left = indexInput.length(); left > 0; --left) {
-            indexInput.readByte();
+        final byte[] buffer = new byte[READ_ALL_BUFFER_SIZE];
+        for (long left = indexInput.length(); left > 0;) {
+            final int chunk = (int) Math.min(buffer.length, left);
+            indexInput.readBytes(buffer, 0, chunk);
+            left -= chunk;
         }
     }
 }

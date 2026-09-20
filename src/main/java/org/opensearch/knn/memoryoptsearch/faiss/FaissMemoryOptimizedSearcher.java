@@ -18,6 +18,8 @@ import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.knn.KnnSearchStrategy;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.hnsw.HnswGraphSearcher;
@@ -32,6 +34,7 @@ import org.opensearch.knn.memoryoptsearch.VectorSearcher;
 import org.opensearch.knn.memoryoptsearch.faiss.cagra.FaissCagraHNSW;
 
 import java.io.IOException;
+import java.nio.file.NoSuchFileException;
 
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.EXHAUSTIVE_BULK_SCORE_ORDS;
 import static org.opensearch.knn.common.KNNConstants.SPACE_TYPE;
@@ -46,6 +49,9 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
     private final FlatVectorsScorer flatVectorsScorer;
     private final FaissHNSW hnsw;
     private final VectorSimilarityFunction vectorSimilarityFunction;
+    private final Directory directory;
+    private final String fileName;
+    private final IOContext warmUpIoContext;
     private boolean isAdc;
 
     /**
@@ -58,8 +64,38 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
         final FieldInfo fieldInfo,
         final FlatVectorsScorer flatVectorsScorer
     ) {
+        this(indexInput, faissIndex, fieldInfo, flatVectorsScorer, null, null, null);
+    }
+
+    /**
+     * Constructor that additionally carries the information required to open a dedicated
+     * readahead-friendly warmup stream: the {@link Directory}, the file name and an
+     * {@link IOContext} carrying a {@link org.apache.lucene.store.DataAccessHint#SEQUENTIAL}
+     * data-access hint.
+     * <p>
+     * The page cache is file-wide, so warming the file through a SEQUENTIAL-advised mapping
+     * fills the same pages the RANDOM-advised search mapping reads afterwards — with kernel
+     * readahead enabled during warmup instead of page-by-page synchronous faults.
+     *
+     * @param directory directory the faiss file lives in; {@code null} disables the dedicated warmup stream
+     * @param fileName name of the faiss file inside {@code directory}; {@code null} disables the dedicated warmup stream
+     * @param warmUpIoContext IOContext carrying the SEQUENTIAL data-access hint for warmup;
+     *                        {@code null} disables the dedicated warmup stream
+     */
+    public FaissMemoryOptimizedSearcher(
+        final IndexInput indexInput,
+        final FaissIndex faissIndex,
+        final FieldInfo fieldInfo,
+        final FlatVectorsScorer flatVectorsScorer,
+        final Directory directory,
+        final String fileName,
+        final IOContext warmUpIoContext
+    ) {
         this.indexInput = indexInput;
         this.faissIndex = faissIndex;
+        this.directory = directory;
+        this.fileName = fileName;
+        this.warmUpIoContext = warmUpIoContext;
         // Faiss's on-disk format only stores METRIC_INNER_PRODUCT or METRIC_L2; there is no
         // cosine metric. Cosinesimil indices are written as IP on L2-normalized vectors, so
         // faissIndex.getVectorSimilarityFunction() reports MAXIMUM_INNER_PRODUCT for them.
@@ -171,12 +207,28 @@ public class FaissMemoryOptimizedSearcher implements VectorSearcher {
 
     @Override
     public void warmUp() throws IOException {
-        // Warm up graph
-        final IndexInput warmUpIndexInput = indexInput.clone();
-        WarmupUtil.readAll(warmUpIndexInput);
+        // 1) Graph (.faiss): read it through a dedicated readahead-friendly stream when available.
+        //    The page cache is file-wide, so the RANDOM-advised search mapping hits the pages
+        //    populated here with zero additional I/O afterwards.
+        boolean graphWarmed = false;
+        if (directory != null && fileName != null && warmUpIoContext != null) {
+            try (IndexInput sequentialInput = directory.openInput(fileName, warmUpIoContext)) {
+                WarmupUtil.readAll(sequentialInput);
+                graphWarmed = true;
+            } catch (NoSuchFileException e) {
+                // The segment may have just been removed by a merge; the search input still holds
+                // a valid file descriptor, so fall back to the legacy path below.
+                log.debug("Warmup stream for [{}] vanished, falling back to the search input", fileName);
+            }
+        }
 
-        // Warm up flat vectors
-        // This can warm up .veb, .vec or .faiss
+        final IndexInput warmUpIndexInput = indexInput.clone();
+        if (graphWarmed == false) {
+            WarmupUtil.readAll(warmUpIndexInput);
+        }
+
+        // 2) Flat vectors — keep as-is: for HNSW+flat it touches the same (now cached) pages
+        //    cheaply; for SQ skip-storage it warms the separate .veq/.vec via Lucene reader.
         if (faissIndex.getVectorEncoding() == VectorEncoding.FLOAT32) {
             WarmupUtil.readAll(faissIndex.getFloatValues(warmUpIndexInput));
         } else if (faissIndex.getVectorEncoding() == VectorEncoding.BYTE) {

@@ -95,7 +95,7 @@ public class NativeEngines990KnnVectorsReaderTests extends KNNTestCase {
         VectorSearcher mockSearcher = mock(VectorSearcher.class);
         when(mockSearcher.getByteVectorValues(any())).thenReturn(mock(ByteVectorValues.class));
         when(mockFaiss.getVectorSearcherFactory()).thenReturn(mockFactory);
-        when(mockFactory.createVectorSearcher(any(), any(), any(), any(), any())).thenReturn(mockSearcher);
+        when(mockFactory.createVectorSearcher(any(), any(), any(), any(), any(), any())).thenReturn(mockSearcher);
 
         final FloatVectorValues mockFloatValues = mock(FloatVectorValues.class);
         when(mockFloatValues.iterator()).thenReturn(mock(KnnVectorValues.DocIndexIterator.class));
@@ -133,7 +133,7 @@ public class NativeEngines990KnnVectorsReaderTests extends KNNTestCase {
     public void testWhenMemoryOptimizedSearchIsEnabled_mixedCase() {
         KNNEngine mockFaiss = spy(KNNEngine.FAISS);
         VectorSearcherFactory mockFactory = mock(VectorSearcherFactory.class);
-        when(mockFactory.createVectorSearcher(any(), any(), any(), any(), any())).thenReturn(mock(VectorSearcher.class));
+        when(mockFactory.createVectorSearcher(any(), any(), any(), any(), any(), any())).thenReturn(mock(VectorSearcher.class));
         when(mockFaiss.getVectorSearcherFactory()).thenReturn(mockFactory);
         try (MockedStatic<KNNEngine> mockedStatic = mockStatic(KNNEngine.class)) {
             // Prepare field infos

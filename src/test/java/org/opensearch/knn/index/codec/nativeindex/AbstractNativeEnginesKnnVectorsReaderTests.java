@@ -19,9 +19,13 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.IOSupplier;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.opensearch.knn.KNNTestCase;
 import org.opensearch.knn.common.KNNConstants;
@@ -65,6 +69,58 @@ public class AbstractNativeEnginesKnnVectorsReaderTests extends KNNTestCase {
     }
 
     // --- getVectorSearcherSupplier ---
+
+    /**
+     * The reader must derive two independent IO contexts from the segment read state:
+     * the search context carrying the RANDOM data-access hint (readahead is harmful for
+     * HNSW random access) and a warmup context carrying the SEQUENTIAL hint (a warmup is
+     * one full sequential pass for which kernel readahead is a large win). The warmup
+     * context must never contain the RANDOM hint.
+     */
+    @SneakyThrows
+    public void testIoContexts_warmUpContextIsSequential_searchContextIsRandom() {
+        final TestReader reader = createReader(new FieldInfos(new FieldInfo[0]), Collections.emptySet(), mock(FlatVectorsReader.class));
+
+        assertTrue(reader.ioContext.hints().contains(DataAccessHint.RANDOM));
+        assertFalse(reader.ioContext.hints().contains(DataAccessHint.SEQUENTIAL));
+
+        assertTrue(reader.warmUpIoContext.hints().contains(DataAccessHint.SEQUENTIAL));
+        assertFalse("warmup context must not carry the RANDOM data-access hint", reader.warmUpIoContext.hints().contains(DataAccessHint.RANDOM));
+        // The file-level hints must be preserved on both contexts.
+        assertTrue(reader.warmUpIoContext.hints().contains(FileTypeHint.DATA));
+        assertTrue(reader.warmUpIoContext.hints().contains(FileDataHint.KNN_VECTORS));
+    }
+
+    /**
+     * The supplier created by the reader must pass the warmup IO context through to the
+     * factory's extended createVectorSearcher overload.
+     */
+    @SneakyThrows
+    public void testGetVectorSearcherSupplier_whenAllConditionsMet_thenPassesWarmUpIoContextToFactory() {
+        final FieldInfo fi = createKnnFieldInfo("field1", KNNEngine.FAISS, 0);
+        KNNEngine mockFaiss = spy(KNNEngine.FAISS);
+        VectorSearcherFactory mockFactory = mock(VectorSearcherFactory.class);
+        when(mockFaiss.getVectorSearcherFactory()).thenReturn(mockFactory);
+        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any(), any())).thenReturn(mock(VectorSearcher.class));
+
+        try (MockedStatic<KNNEngine> ms = mockStatic(KNNEngine.class)) {
+            ms.when(() -> KNNEngine.getEngine(any())).thenReturn(mockFaiss);
+            ms.when(KNNEngine::getEnginesThatCreateCustomSegmentFiles).thenReturn(ImmutableSet.of(mockFaiss));
+            final TestReader reader = createReader(
+                new FieldInfos(new FieldInfo[] { fi }),
+                Set.of("_0_165_field1.faiss"),
+                mock(FlatVectorsReader.class)
+            );
+            final IOSupplier<VectorSearcher> supplier = reader.getVectorSearcherSupplier(fi);
+            assertNotNull(supplier);
+            supplier.get();
+
+            final ArgumentCaptor<IOContext> warmUpCtxCaptor = ArgumentCaptor.forClass(IOContext.class);
+            verify(mockFactory).createVectorSearcher(any(), anyString(), any(), any(), warmUpCtxCaptor.capture(), any());
+            assertTrue(warmUpCtxCaptor.getValue().hints().contains(DataAccessHint.SEQUENTIAL));
+            assertFalse(warmUpCtxCaptor.getValue().hints().contains(DataAccessHint.RANDOM));
+        }
+    }
 
     @SneakyThrows
     public void testGetVectorSearcherSupplier_whenNonKnnField_thenReturnsNull() {
@@ -135,7 +191,7 @@ public class AbstractNativeEnginesKnnVectorsReaderTests extends KNNTestCase {
         KNNEngine mockFaiss = spy(KNNEngine.FAISS);
         VectorSearcherFactory mockFactory = mock(VectorSearcherFactory.class);
         when(mockFaiss.getVectorSearcherFactory()).thenReturn(mockFactory);
-        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any())).thenReturn(mock(VectorSearcher.class));
+        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any(), any())).thenReturn(mock(VectorSearcher.class));
 
         try (MockedStatic<KNNEngine> ms = mockStatic(KNNEngine.class)) {
             ms.when(() -> KNNEngine.getEngine(any())).thenReturn(mockFaiss);
@@ -160,7 +216,7 @@ public class AbstractNativeEnginesKnnVectorsReaderTests extends KNNTestCase {
         VectorSearcherFactory mockFactory = mock(VectorSearcherFactory.class);
         VectorSearcher mockSearcher = mock(VectorSearcher.class);
         when(mockFaiss.getVectorSearcherFactory()).thenReturn(mockFactory);
-        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any())).thenReturn(mockSearcher);
+        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any(), any())).thenReturn(mockSearcher);
 
         try (MockedStatic<KNNEngine> ms = mockStatic(KNNEngine.class)) {
             ms.when(() -> KNNEngine.getEngine(any())).thenReturn(mockFaiss);
@@ -174,7 +230,7 @@ public class AbstractNativeEnginesKnnVectorsReaderTests extends KNNTestCase {
             final VectorSearcher second = reader.loadMemoryOptimizedSearcherIfRequired(fi);
             assertSame(first, second);
             // factory called exactly once
-            verify(mockFactory).createVectorSearcher(any(), anyString(), any(), any(), any());
+            verify(mockFactory).createVectorSearcher(any(), anyString(), any(), any(), any(), any());
         }
     }
 
@@ -184,7 +240,7 @@ public class AbstractNativeEnginesKnnVectorsReaderTests extends KNNTestCase {
         KNNEngine mockFaiss = spy(KNNEngine.FAISS);
         VectorSearcherFactory mockFactory = mock(VectorSearcherFactory.class);
         when(mockFaiss.getVectorSearcherFactory()).thenReturn(mockFactory);
-        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any())).thenThrow(new IOException("disk error"));
+        when(mockFactory.createVectorSearcher(any(), anyString(), any(), any(), any(), any())).thenThrow(new IOException("disk error"));
 
         try (MockedStatic<KNNEngine> ms = mockStatic(KNNEngine.class)) {
             ms.when(() -> KNNEngine.getEngine(any())).thenReturn(mockFaiss);

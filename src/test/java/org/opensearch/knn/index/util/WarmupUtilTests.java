@@ -12,8 +12,15 @@ import org.apache.lucene.store.IndexInput;
 import org.opensearch.knn.KNNTestCase;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.stream.Collectors;
 
+import org.mockito.ArgumentCaptor;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -31,7 +38,7 @@ import static org.mockito.Mockito.when;
  */
 public class WarmupUtilTests extends KNNTestCase {
 
-    // Verify that readAll(IndexInput) seeks to the beginning and reads every byte.
+    // Verify that readAll(IndexInput) seeks to the beginning and reads every byte in bulk chunks.
     public void testReadAllIndexInput_readsAllBytes() throws IOException {
         IndexInput mockInput = mock(IndexInput.class);
         long length = 5L;
@@ -39,9 +46,26 @@ public class WarmupUtilTests extends KNNTestCase {
 
         WarmupUtil.readAll(mockInput);
 
-        // Should start from position 0 and read exactly `length` bytes
+        // Should start from position 0 and read exactly `length` bytes in a single short chunk
         verify(mockInput).seek(0);
-        verify(mockInput, times((int) length)).readByte();
+        verify(mockInput).readBytes(any(byte[].class), eq(0), eq((int) length));
+        verify(mockInput, never()).readByte();
+    }
+
+    // Verify that readAll(IndexInput) splits inputs larger than the internal buffer into
+    // consecutive full-size chunks followed by a shorter remainder chunk.
+    public void testReadAllIndexInput_readsInBulkChunks() throws IOException {
+        final int bufferSize = 64 * 1024;
+        IndexInput mockInput = mock(IndexInput.class);
+        long length = 2L * bufferSize + 100L;
+        when(mockInput.length()).thenReturn(length);
+
+        WarmupUtil.readAll(mockInput);
+
+        verify(mockInput).seek(0);
+        ArgumentCaptor<Integer> lenCaptor = ArgumentCaptor.forClass(Integer.class);
+        verify(mockInput, times(3)).readBytes(any(byte[].class), eq(0), lenCaptor.capture());
+        assertEquals(List.of(bufferSize, bufferSize, 100), lenCaptor.getAllValues().stream().map(Integer::intValue).collect(Collectors.toList()));
     }
 
     // When FloatVectorValues does NOT implement HasIndexSlice, readAll should
@@ -86,7 +110,7 @@ public class WarmupUtilTests extends KNNTestCase {
 
         // Warmup should go through the slice, not individual vectorValue calls
         verify(mockSlice).seek(0);
-        verify(mockSlice, times((int) sliceLength)).readByte();
+        verify(mockSlice).readBytes(any(byte[].class), eq(0), eq((int) sliceLength));
     }
 
     // When ByteVectorValues implements HasIndexSlice, readAll should delegate
@@ -103,7 +127,7 @@ public class WarmupUtilTests extends KNNTestCase {
 
         // Warmup should go through the slice, not individual vectorValue calls
         verify(mockSlice).seek(0);
-        verify(mockSlice, times((int) sliceLength)).readByte();
+        verify(mockSlice).readBytes(any(byte[].class), eq(0), eq((int) sliceLength));
     }
 
     // When FloatVectorValues implements HasIndexSlice but getSlice() returns null (e.g. a
